@@ -7,9 +7,9 @@
 ## 1. 요약
 
 
-하루 방문자 100명 규모의 저비용 서비스는 처음부터 여러 서비스로 쪼개지 않고, **Vercel 웹·모바일 앱 → Oracle VM의 단일 API → (필요 시 WireGuard VPN) 가정용 PostgreSQL**의 단순한 구조를 목표로 한다. Neon Free의 일일 접속 제한이 실제 서비스 운영을 막지 않는 동안은 임시 DB로 사용할 수 있으며, 제한이 사용 시간에 영향을 주면 집 서버 DB로 전환한다. RabbitMQ는 초기 범위에서 제외하고 비동기 작업이 실제로 생긴 뒤 도입한다.
+하루 방문자 100명 규모의 저비용 서비스에서 목표 구조는 **Vercel 웹·앱 → Oracle VM의 HTTPS API → Oracle VM의 RabbitMQ → 가정용 백엔드 consumer → 가정용 PostgreSQL**이다. 집의 백엔드는 RabbitMQ에 TLS 연결을 맺고 요청을 받아 로컬 DB 작업을 수행한다. Oracle API는 Request-Reply 응답을 기다린 뒤 HTTPS 응답을 돌려준다. 이 구조는 집 서버에 공개 HTTP/API 포트를 열거나 DB에 직접 원격 접속하지 않게 한다. Neon Free는 전환 전 임시 DB 또는 개발 환경으로만 사용한다.
 
-Neon의 일일 DB 접속 제한에 도달하면 먼저 pooler 구성과 앱 연결 수명·일일 사용량을 점검한다. 병목이 지속되면 DB를 Oracle VM 또는 가정용 PostgreSQL로 이전한다. 저장 공간은 현재 주요 제약이 아니므로 디스크 크기만으로 이전을 결정하지 않는다. 가정용 서버를 주 DB로 사용하는 안은 기술적으로 가능하지만, 집의 전원·인터넷·공유기·노트북 상태가 곧 서비스 가용성이 되므로 운영 복구와 외부 백업을 갖춘 뒤 선택한다.
+Neon Free의 일일 접속 제한을 피하기 위해 가정용 PostgreSQL을 운영 DB 후보로 삼고, 집의 별도 백엔드 서비스가 메시지를 소비해 DB 작업을 수행한다. RabbitMQ는 집 서버의 인바운드 애플리케이션 포트 대신 AMQPS 연결을 사용하게 한다. 단, TLS는 전송을 암호화하는 수단이며 인증·권한·접근 제어를 대신하지 않는다. 집의 전원·인터넷·노트북 및 Oracle broker 장애가 서비스 지연이나 중단으로 이어지므로 타임아웃, 재시도, 복구와 외부 백업을 설계한다.
 
 **무료 인프라는 비용을 줄이는 수단이지 상용 서비스의 가용성 보장이 아니다.** 무료 구간의 할당량과 계정별 잔여 한도, 지역별 용량, 정책은 수시로 달라질 수 있으므로 Oracle 콘솔과 Neon 사용량 화면을 기준으로 확인한다.
 
@@ -24,11 +24,12 @@ Neon의 일일 DB 접속 제한에 도달하면 먼저 pooler 구성과 앱 연�
 - Oracle Cloud 무료 VM 3대를 확보했고, Neon DB를 사용 중이다.
 - Neon Free의 일일 연결 가능량/사용 가능 시간 제약이 핵심 우려다. 저장 용량은 현재 핵심 병목으로 보지 않는다.
 - Oracle 무료 VM은 최소 사양에 가까워 CPU·메모리 여유가 제한적이다. 디스크는 충분할 수 있으며 컴퓨트 병목과 별도로 다룬다.
-- 가정용 고성능 노트북을 DB 서버로 활용하는 안을 검토 중이다. 하루 방문자 100명 규모를 우선 목표로 하며, 트래픽은 단순 CRUD 중심으로 가정한다.
+- 가정용 고성능 노트북에서 PostgreSQL과 별도 백엔드 consumer 서비스를 운영한다. 하루 방문자 100명 규모, 단순 CRUD 중심을 우선 목표로 한다.
+- 집 PC는 RabbitMQ에 연결을 시작하는 consumer이며, Oracle에서 집으로 들어오는 HTTP/API 연결은 열지 않는 방향을 검토한다.
 
 ### 규모 가정과 설계 기준
 - 목표는 하루 방문자 약 100명이다. 이 숫자는 100명 동시 접속을 뜻하지 않는다. 사용자별 요청 수, 방문 집중 시간, API 호출 패턴에 따라 실제 피크 부하와 DB 연결 수는 달라진다.
-- 초기에는 단일 API 인스턴스와 단일 PostgreSQL DB를 사용하고, 동기 CRUD는 HTTP API에서 직접 처리한다. 이 규모에서 RabbitMQ와 API/worker 분리는 기본 요구사항이 아니다.
+- 웹·앱에서 보이는 API는 단일 Oracle VM에서 운영한다. 사용자 CRUD는 API가 RabbitMQ에 Request-Reply 메시지를 보내고 집 consumer가 PostgreSQL 작업 후 응답하는 구조로 처리한다. RabbitMQ가 제공하는 요청 중계와 집 consumer의 아웃바운드 연결을 이용해 집 서버의 공개 API/DB 포트를 두지 않는다.
 - 출시 전 대표 사용자 여정(CRUD, 로그인, 목록·상세 조회)을 사용해 하루 100명 분량의 요청 프로파일과 예상 피크 시간대 부하를 재현한다. 측정된 CPU·메모리, API 지연, DB pool 대기·연결 수를 기준으로 VM과 DB 위치를 정한다.
 - 방문자 100명/일이라는 값만으로 처리량·동시 접속 보장은 계산하지 않는다. 실제 사용량을 관측하고 피크가 예상보다 크면 재평가한다.
 
@@ -46,106 +47,106 @@ Neon의 일일 DB 접속 제한에 도달하면 먼저 pooler 구성과 앱 연�
 
 ```mermaid
 flowchart LR
-  WEB[Next.js 웹<br/>Vercel] -->|HTTPS REST/JSON| API[백엔드 API<br/>Oracle VM 1]
-  APP[React Native 앱] -->|HTTPS REST/JSON| API
-  API -->|WireGuard VPN 사설 경로| HOME[가정용 DB 서버]
-  HOME --> PG[(PostgreSQL<br/>목표 운영 DB)]
-  API -. 임시 또는 개발 단계 .-> DB[(Neon Postgres)]
-  API -->|비동기 작업 발행| MQ[RabbitMQ<br/>Oracle VM 2, 필요 시]
-  MQ --> WORKER[백그라운드 Worker<br/>Oracle VM 2 또는 3]
-  WORKER --> PG
-  API -->|로그·메트릭| OBS[로그/모니터링<br/>Oracle VM 3 또는 관리형 무료 도구]
-  PG -. 백업 내보내기 .-> BACKUP[별도 백업 저장소<br/>암호화·복구 점검]
+  WEB[Next.js 웹<br/>Vercel] -->|HTTPS 443| API[공개 API<br/>Oracle VM 1]
+  APP[React Native 앱] -->|HTTPS 443| API
+  API -->|AMQPS 명령 + correlation ID| MQ[RabbitMQ broker<br/>Oracle VM 2]
+  HOME[가정용 백엔드 consumer<br/>상시 실행, outbound 연결] -->|요청 consume / reply publish| MQ
+  HOME -->|localhost 또는 LAN| PG[(가정용 PostgreSQL)]
+  MQ -->|reply_to 결과| API
+  API -. 전환 전 또는 개발용 .-> NEON[(Neon Postgres)]
+  PG -. 암호화 백업 .-> BACKUP[집 밖 백업 저장소]
+  API --> OBS[로그·메트릭]
 ```
 
-Oracle VM 사양이 최소이므로 초기에 VM 하나는 API 진입점 역할에 집중한다. 가정용 PostgreSQL은 VPN 사설 경로로만 연결하고, 가정 회선 장애가 곧 DB 장애가 된다는 운영 위험을 받아들이는 비용 절감 선택지로 둔다. RabbitMQ, worker, 별도 모니터링 VM은 초기 필수 구성요소가 아니다. VM을 여러 대로 쪼개기보다 실제 병목이 확인된 뒤 분리한다.
+Oracle VM 1은 공개 API, Oracle VM 2는 RabbitMQ를 담당한다. 가정용 PC에서는 PostgreSQL과 **별도 백엔드 consumer 프로세스**가 함께 실행된다. Consumer는 먼저 broker에 AMQPS 연결을 맺고 요청을 소비한 뒤, 로컬 DB 트랜잭션을 수행하고 응답을 broker에 게시한다. 집 공유기에는 인바운드 HTTP/API나 DB 포트를 열지 않는다. RabbitMQ가 인터넷에서 연결 가능한 broker listener가 되므로 broker 자체는 강하게 보호해야 한다.
 
 ### 동기 CRUD 요청 흐름
 
-1. 브라우저 또는 앱이 인증 정보를 포함해 API에 HTTPS 요청을 보낸다.
-2. API가 인증·인가, 입력 검증, 속도 제한을 수행한다.
-3. API가 DB connection pool을 통해 PostgreSQL에 SQL 트랜잭션을 수행한다. DB가 집에 있는 경우 연결은 WireGuard VPN 사설 주소를 사용한다.
-4. API가 성공 또는 구체적인 오류 상태와 결과를 HTTP 응답으로 반환한다.
+1. 웹/앱이 사용자 인증정보와 함께 Oracle API에 HTTPS 요청을 보낸다.
+2. API가 인증·인가, 입력 검증, 속도 제한을 수행하고 요청별 correlation ID와 `reply_to`를 정한다.
+3. API가 Oracle VM 2의 RabbitMQ에 AMQPS로 CRUD 명령을 보낸다.
+4. 집 consumer의 지속적인 outbound AMQPS 연결에서 명령을 받아 허용된 작업인지 확인하고 PostgreSQL 트랜잭션을 수행한다.
+5. 트랜잭션 결과를 correlation ID가 포함된 응답 메시지로 `reply_to`에 게시한 뒤, 처리 완료한 요청을 ack한다.
+6. API가 일치하는 reply를 제한 시간 안에 받으면 HTTP 응답으로 변환한다. 시간 초과나 연결 단절은 오류 응답으로 돌려준다.
 
-일반적인 CRUD는 DB를 직접 호출하는 이 경로가 기본이다. 웹과 앱은 같은 API 계약을 쓰며, DB 자격 증명은 클라이언트에 포함하지 않는다.
+DB 자격 증명은 가정용 consumer에만 둔다. 브라우저와 모바일은 HTTP API만 호출하고 RabbitMQ나 PostgreSQL에 직접 접속하지 않는다.
 
 ### 비동기 작업 흐름
 
-1. API가 사용자 작업을 DB에 저장하고, 필요한 비동기 작업을 큐에 넣는다.
-2. Worker가 메시지를 처리한 뒤 성공 확인(ack)을 하거나, 제한된 재시도/격리 큐 정책을 따른다.
-3. 사용자에게 즉시 결과가 필요 없는 작업은 API가 작업 ID를 반환하고, 클라이언트는 상태 조회 또는 알림을 사용한다.
+CRUD Request-Reply와 별도로, 알림·파일 변환처럼 기다리지 않아도 되는 작업은 별도 비동기 큐와 worker로 처리할 수 있다. 초기에는 집 consumer 하나로 시작하고 실제 작업량이 늘어났을 때만 consumer 수나 역할을 분리한다.
 
 ## 4. RabbitMQ Request-Reply 평가
 
-RabbitMQ의 Request-Reply는 구현 가능한 패턴이다. RabbitMQ 문서는 요청의 `reply_to`와 고유 `correlation_id`를 이용해 응답을 매칭하고, worker 장애 뒤 요청 재처리로 중복 결과가 생길 수 있어 멱등성을 고려하도록 안내한다. [RabbitMQ RPC 튜토리얼](https://www.rabbitmq.com/tutorials/tutorial-six-javascript)
+이 설계에서 RabbitMQ는 일반 CRUD의 Request-Reply 통신 경계다. 선택 이유는 **HTTPS보다 AMQPS의 TLS가 더 안전해서가 아니다.** HTTP도 TLS를 적용하면 HTTPS로 암호화되고, RabbitMQ AMQP도 TLS를 적용하면 AMQPS가 된다. 두 프로토콜 모두 TLS 설정, 인증, 권한, 키 관리가 올바를 때 전송 구간을 보호한다. [RabbitMQ TLS 문서](https://www.rabbitmq.com/docs/ssl), [AMQPS URI 규격](https://www.rabbitmq.com/docs/uri-spec)
 
-다만 모든 UI CRUD를 `API → RabbitMQ → 집의 worker/DB → 응답 대기`로 보내는 것은 초기 기본안으로 권하지 않는다.
+이 구조에서 메시징을 택하는 실질적인 이유는 다음과 같다.
 
-- API 응답이 집의 전원·노트북·ISP 연결에 종속된다. 집이 끊기거나 worker가 내려가면 큐 적체, API 타임아웃, 사용자 오류가 발생한다.
-- 웹 요청의 대기 시간이 DB 직접 호출보다 길어질 수 있고, 브라우저·모바일·API·브로커·집 서버 간 장애 원인을 추적하기 어렵다.
-- 메시지 재전달이나 worker 재시작 때문에 변경 요청을 멱등하게 설계해야 한다.
-- 사용량이 작을 때는 큐와 응답 매칭·타임아웃·재시도·관측을 유지하는 부담이 DB 직접 CRUD의 이득보다 크다.
+- 가정용 PC가 broker에 outbound 연결을 시작하므로 집에 공개 HTTP/API endpoint를 두지 않는다.
+- Oracle API가 집의 공인 IP, NAT, 라우터 포트 포워딩을 직접 관리하지 않고, 집 DB도 인터넷에 노출하지 않는다.
+- DB와 데이터 처리 서비스가 집 내부에 있어 DB 연결을 로컬로 유지한다.
+- API와 집 서비스가 broker를 통해 느슨하게 연결되고, 응답 상관 ID와 큐 기반 전달·재연결 처리가 가능하다.
 
-Request-Reply를 정말 써야 할 때는 짧은 작업에 한정한다. 요청별 고유 correlation ID, 명시적인 reply 주소, 유한 타임아웃, 실패 시 HTTP 오류 매핑, 중복 작업 방지용 idempotency key, 상관 ID 로그, 메시지 크기 제한을 정한다. 브라우저나 모바일 클라이언트가 RabbitMQ에 직접 접속하지 않도록 하고 API만 브로커 자격 증명을 보유한다.
+대신 Oracle의 RabbitMQ listener(AMQPS 5671)는 집 consumer가 연결할 수 있도록 도달 가능해야 한다. 즉 집 포트를 닫는 대신 broker를 보호해야 하며, TLS만 켰다고 broker가 안전해지는 것은 아니다. TLS는 기밀성과 전송 중 무결성을 제공하지만, 무단 접속·권한 과다·취약한 비밀번호·서비스 거부를 단독으로 막지 않는다.
 
-## 5. DB 배치 선택지
+Request-Reply는 집 PC나 broker가 중단될 때 응답이 지연되고 큐에 요청이 쌓일 수 있다. 메시지 재전달이나 consumer 장애 때문에 쓰기 작업이 중복될 수도 있다. 요청마다 고유 correlation ID, 유한 timeout, idempotency key, 트랜잭션 커밋 후 ack, 재시도 횟수 제한 및 격리 큐, 큐 적체 알림을 둔다. API는 timeout 시 무한 대기하거나 무조건 재시도하지 않는다. [RabbitMQ RPC 튜토리얼](https://www.rabbitmq.com/tutorials/tutorial-six-javascript)
+
+## 5. DB 및 처리 서비스 배치 선택지
 
 | 선택지 | 장점 | 주요 단점·위험 | 적합한 시점 |
 |---|---|---|---|
-| Neon을 임시/개발 DB로 유지 | 설정과 운영이 간단하고 DB 서버를 직접 관리하지 않아도 됨 | 일일 접속 제한이 운영 시간을 막을 수 있음. 계정의 제한·재설정 시각 확인 필요 | 제한이 하루 100명 대상 서비스 운영에 지장을 주지 않는 초기 검증 기간 |
-| Oracle VM의 PostgreSQL | Neon 일일 한도 의존을 없애고 API와 DB를 같은 네트워크에 둘 수 있음 | 최소 CPU·메모리로 API와 DB가 자원을 놓고 경쟁함. 패치·백업·복구도 직접 운영 | CPU·메모리 부하 시험에서 단일 VM이 API와 DB를 함께 감당할 때만 검토 |
-| 가정용 PostgreSQL | Neon 일일 접속 한도와 OCI VM의 최소 컴퓨트 제약을 피하면서 기존 고성능 장비를 활용 | 집 전원·인터넷·공유기·노트북 중단이 곧 DB 중단. VPN·복구·집 밖 백업을 직접 운영 | 하루 100명 수준의 사용자에게 중단 위험을 설명하고, VPN·자동 복구·외부 백업을 검증한 경우 목표 운영 DB로 우선 검토 |
+| Neon을 임시/개발 DB로 유지 | 직접 DB 운영이 필요 없고 설정이 간단함 | 사용자가 지적한 일일 접속 제한이 서비스 시간을 막을 수 있음 | 계정의 일일 제한이 하루 100명 목표에 지장을 주지 않을 때 |
+| OCI VM에서 API·RabbitMQ·PostgreSQL 운영 | 모든 cloud 서비스가 한 네트워크에 있음 | 최소 CPU·메모리 자원을 API, broker, DB가 나눠 쓰고 운영 작업도 직접 맡음. 디스크가 충분해도 메모리/CPU 병목은 해결되지 않음 | 대표 부하 시험에서 해당 VM 자원으로 감당됨이 확인될 때만 |
+| OCI API + RabbitMQ + 가정용 consumer/PostgreSQL | 집에 공개 API·DB 포트를 열지 않고 로컬 DB와 고성능 PC를 사용. Neon 일일 제한 회피 가능 | AMQPS broker 보안, Request-Reply와 consumer 운영, 집/ISP 정전 시 가용성 저하 | 본 문서의 목표 구조. AMQPS 접근통제 및 timeout·복구 검증을 갖춘 경우 |
 
-**권장 방향:** 하루 방문자 100명 규모에서 Neon의 일일 접속 제한이 서비스 연속성을 허용하면 Neon pooled connection으로 운영을 시작해도 된다. 제한이 실제 고객 이용 시간을 막는다면 pooler 최적화 후 가정용 노트북의 PostgreSQL을 WireGuard VPN으로 Oracle API에 연결하는 구성을 목표로 한다. OCI 최소 사양 VM은 API 역할에 집중하고, DB와 RabbitMQ를 한 VM에 추가하지 않는다. 디스크 용량은 주 판단 기준이 아니다.
+**권장 방향:** 하루 방문자 100명 기준, Oracle VM 1은 API, Oracle VM 2는 RabbitMQ broker, 가정용 PC는 별도 consumer와 PostgreSQL 역할을 맡는다. RabbitMQ를 통해 집으로 CRUD 명령을 보내고 응답을 돌려받는다. DB에 대한 WireGuard VPN 직접 접속은 기본 경로로 사용하지 않는다. Neon은 일일 접속 제한이 사용 요구에 맞는지 검증하는 동안 임시로 유지하거나 개발 DB로 둔다.
 
-Neon은 pooler를 제공하며 문서상 pooled connection은 compute의 직접 `max_connections` 병목을 피하는 방법이다. 따라서 연결 문제가 곧바로 DB 자체를 옮겨야 한다는 뜻은 아니다. 앱 서버리스 환경에서 요청마다 새 연결을 만들지 말고, Neon pooled connection string과 적절한 클라이언트 풀 설정을 사용한다. [Neon connection pooling](https://neon.com/docs/connect/connection-pooling)
+Neon pooler는 직접 Postgres 동시 연결 수를 줄이는 데 도움이 되지만, 계정에서 확인한 일일 제한이 별도의 접속량/사용시간 한도라면 pooling만으로 해소된다고 가정하지 않는다. 실제 대시보드에서 제한 종류와 재설정 주기를 확인한다. 저장 용량과 디스크는 현재 핵심 의사결정 기준이 아니다.
 
-이 설계의 입력 조건은 Neon Free 이용 시 하루 단위 연결/접속 제한이 서비스 연속성에 영향을 준다는 점이다. 사용 중인 계정 화면에서 남은 일일 이용량과 재설정 시점을 확인하고, 사용량을 기록한다. Neon의 공개 문서는 별도로 월 compute allowance와 compute별 동시 연결 상한을 안내하므로, 계정에서 보이는 일일 제한의 명칭과 집계 기준을 그대로 문서화해 혼동하지 않도록 한다. 저장 용량은 현재 핵심 병목으로 보지 않는다.
+## 6. 가정용 백엔드와 RabbitMQ 보안·네트워크
 
-## 6. 가정용 DB를 선택할 경우의 네트워크·보안
-
-### 연결 토폴로지
+### 네트워크 토폴로지
 
 ```mermaid
 flowchart LR
-  CLIENT[웹/앱] -->|HTTPS 443| API[Oracle API VM]
-  API -->|WireGuard 암호화 터널<br/>사설 주소로만 연결| HOME[가정용 DB 서버]
-  HOME --> PG[(PostgreSQL<br/>VPN 인터페이스에만 바인딩)]
-  HOME -. 암호화된 정기 백업 .-> OFFSITE[집 밖의 저장 위치]
+  CLIENT[웹/앱] -->|HTTPS 443| API[Oracle API VM 1]
+  API -->|내부 AMQPS| MQ[RabbitMQ VM 2<br/>AMQPS 5671]
+  HOME[가정용 백엔드 consumer] -->|아웃바운드 AMQPS 세션<br/>요청 consume / 응답 publish| MQ
+  HOME -->|localhost 또는 LAN| PG[(가정용 PostgreSQL)]
+  PG -. 암호화 백업 .-> OFFSITE[집 밖 저장소]
 ```
 
-- Oracle VM과 가정용 서버 사이에 WireGuard 등 VPN을 구성한다. 집의 PostgreSQL 포트(통상 5432)를 인터넷에 직접 공개하지 않고, VPN 사설 IP와 방화벽 규칙으로 API VM만 접근하도록 제한한다.
-- 가능하다면 집 노트북이 외부 VPN endpoint에 outbound로 접속하도록 구성하여 공유기 포트 개방이나 동적 IP 영향을 줄인다. 이때 Oracle VM의 공인 IP와 방화벽 규칙은 최소화한다.
-- DB 연결은 TLS/VPN으로 보호하고, 전송 중 암호화 여부와 Postgres 클라이언트 TLS 설정을 별도로 확인한다. VPN을 쓴다고 DB 권한 관리가 불필요해지는 것은 아니다.
-- 노트북을 닫거나 절전 모드로 보내지 않도록 하고, 재부팅 후 DB와 VPN이 자동 시작되는지 확인한다. 온도·디스크 상태·UPS 여부도 고려한다.
-- 집 인터넷이나 전원이 끊기면 API는 DB 연결 실패를 제한된 시간 안에 오류로 반환해야 한다. 무한 재시도는 API 자원 고갈을 유발하므로 짧은 연결/요청 타임아웃, 제한된 재시도, 장애 알림을 둔다.
-- 동일 장비나 동일 집 안의 다른 디스크만 백업으로 간주하지 않는다. 암호화된 주기별 백업을 집 밖에 보관하고, 다른 위치로 실제 복원하는 리허설을 한다.
+- 집 consumer는 broker에 TLS 연결(AMQPS, 기본 포트 5671)을 시작하고 지속적으로 연결 상태를 확인·복구한다. 집 라우터에는 인바운드 HTTP/API 및 PostgreSQL 포트를 열지 않는다.
+- Broker는 집 consumer가 접속할 수 있는 공개 AMQPS endpoint가 된다. API와 broker는 가능한 경우 OCI 내부망으로 연결한다. Oracle ingress에서 5671만 필요한 소스로 허용한다. 집 공인 IP가 고정이면 allowlist를 적용한다. 동적 IP면 인증서 기반 client authentication, 강한 개별 자격 증명, 접속/메시지 제한과 모니터링을 필수로 하며 공개 broker 노출 위험을 감수한다.
+- RabbitMQ 서버 인증서를 검증하고 가능하면 mTLS client certificate 인증을 사용한다. API와 집 consumer 계정을 분리하고, 전용 vhost와 최소 queue/exchange read/write 권한만 준다. 기본 `guest` 계정과 익명 접근은 사용하지 않는다. [RabbitMQ TLS](https://www.rabbitmq.com/docs/ssl), [RabbitMQ access control](https://www.rabbitmq.com/docs/access-control)
+- AMQPS는 TLS로 AMQP 데이터를 암호화한다. HTTPS도 같은 TLS 기반이므로 이 설계의 보안 이점은 TLS라는 단어가 아니라 집의 공개 HTTP/API·DB listener를 없애고 인증된 outbound consumer와 broker ACL을 사용하는 데 있다.
+- AMQP 비암호화 포트 5672와 Management UI 15672는 공개하지 않는다. 관리 UI와 운영 명령은 localhost 또는 별도의 제한된 관리자 경로에서만 접근한다. [RabbitMQ networking](https://www.rabbitmq.com/docs/networking)
+- PostgreSQL 5432는 loopback 또는 집 내부에서만 listen하도록 하고 consumer만 DB 자격 증명을 가진다. Consumer는 메시지 타입·입력 스키마·사용자 인가 정보를 검증한 후 DB를 변경한다.
+- Consumer와 DB는 재부팅 후 자동 시작하도록 구성하고, broker 연결이 끊어지면 지수 backoff로 재연결한다. 집 인터넷/전원 또는 broker 장애 때 API는 유한 시간 안에 timeout을 반환하고 큐 깊이 및 consumer 상태를 알린다.
+- DB 백업은 암호화해 집 밖 장애 영역에 보관하고 정기 복원 시험을 한다.
 
 ## 7. Oracle VM 활용 원칙
 
-사용자가 보유한 세 VM은 최소 사양에 가까운 인스턴스라는 전제를 둔다. 배치에서는 CPU·메모리와 실제 부하를 우선 고려하며, 디스크는 충분할 수 있으나 주요 의사결정 요소가 아니다. 정확한 shape·CPU·메모리·리전·무료 자격은 콘솔에서 확인한다. 공개 Oracle 문서의 현재 한도는 계정별 잔여량, 특정 시점의 정책, 이미 생성한 리소스에 대한 예외를 모두 대변하지 않는다.
+사용자가 보유한 VM들은 최소 사양에 가까운 컴퓨트라는 전제를 둔다. 디스크가 충분해도 CPU·메모리 한계와 RabbitMQ의 메모리 사용을 별도로 확인한다. 정확한 shape, 리전, 무료 자격과 비용은 OCI 콘솔에서 확인한다.
 
-초기 배치 후보는 다음과 같다.
+1. **VM 1: 공개 백엔드 API.** HTTPS reverse proxy, 인증·인가, 입력 검증과 속도 제한을 처리하고 broker에 내부 네트워크로 Request-Reply를 게시한다.
+2. **VM 2: RabbitMQ broker.** AMQPS 5671로 집 consumer의 연결을 받고 API와 집 backend 사이 메시지를 중계한다. AMQP 비TLS와 Management UI를 공개하지 않는다.
+3. **VM 3: 개발/스테이징, 로그·모니터링 또는 복구 보조.** 실제 자원 용량을 확인하기 전에는 운영의 단일 필수 컴포넌트로 배정하지 않는다.
 
-1. **VM 1: 백엔드 API와 reverse proxy.** HTTPS 진입점, 인증·인가, API 로깅을 운영한다. 웹과 앱이 사용하는 공개 서비스다.
-2. **VM 2: 선택적 worker와 RabbitMQ.** 실제 비동기 작업이 있을 때만 도입한다. RabbitMQ 관리 UI 및 AMQP 포트는 공개 인터넷에 열지 말고 사설 네트워크/VPN에서만 접근한다.
-3. **VM 3: 개발·스테이징, 모니터링 또는 백업 보조.** 잔여 사양과 자격이 확인되기 전에는 운영의 필수 단일 구성요소로 배정하지 않는다.
-
-위 배치는 역할 후보일 뿐 3대 모두 무료·가용하다는 전제가 아니다. VM 사양이 최소 수준이면 초기에는 VM 1에서 API만 운영하고 Neon을 DB로 두어 컴퓨트 부담을 줄인다. OCI VM에 DB를 옮길 때 CPU·메모리 부하 시험을 통과해야 하며 디스크 여유만으로 적합성을 판단하지 않는다. 단일 API VM이 중단되면 API도 중단될 수 있으므로 최소한 배포 재현성, 외부 상태 확인, 복구 절차를 마련한다. 세 VM을 확보했더라도 동일 지역·계정·전원 도메인·무료 한도에 묶여 있을 수 있어 자동으로 고가용성이 생기지 않는다.
+가정용 PC는 **별도 백엔드 consumer와 PostgreSQL**을 함께 실행한다. DB와 consumer는 로컬로 통신하고 외부에는 포트를 열지 않는다. VM 1·2를 같은 최소 사양 VM에 합치면 비용과 운영 지점은 줄지만 API와 broker가 자원을 경쟁하고 한 번의 VM 장애가 두 계층을 모두 멈춘다. 분리할 수 있는 실제 무료 VM 자원이 확보되어 있는지 먼저 확인한다. 3대가 모두 같은 리전·계정·무료 한도에 묶일 수 있어 고가용성으로 간주하지 않는다.
 
 ## 8. 보안과 운영 기준
 
 ### 공개 네트워크와 인증
 
 - 공개 ingress는 HTTPS 443과 SSH 관리 접속에 필요한 최소 경로만 허용한다. SSH는 키 기반 인증과 허용 IP 제한을 적용한다.
-- PostgreSQL 5432와 RabbitMQ AMQP/관리 포트는 공개 인터넷에서 직접 접근 불가하게 한다.
+- PostgreSQL 5432와 RabbitMQ 비TLS AMQP 5672 및 관리 UI 15672는 공개하지 않는다. RabbitMQ 5671 AMQPS는 집 consumer와 API가 접속할 수 있도록 필요한 범위에서만 허용한다.
 - API가 사용자 인증과 리소스별 인가를 수행한다. 단순히 로그인 여부만 확인하지 않고 요청 사용자가 대상 데이터의 소유자/권한자인지 검증한다.
 - CORS는 웹 도메인만 허용하고, 모바일 앱 접근을 이유로 모든 origin을 허용하지 않는다. CORS는 인증/인가를 대신하지 않는다.
 - 속도 제한, 요청 크기 제한, 입력 검증, 로그 내 개인정보·토큰 마스킹을 적용한다.
 
 ### 비밀정보와 데이터
 
-- DB 자격 증명, JWT 비밀키, RabbitMQ 암호는 Vercel 환경변수 또는 서버의 제한된 secret 저장소에 둔다. 저장소, 앱 바이너리, 클라이언트 번들에 포함하지 않는다.
+- DB 자격 증명은 집 consumer에만 두고, RabbitMQ API/consumer 자격 증명과 TLS private key는 각 서버의 제한된 secret 저장소에 둔다. JWT 비밀키는 API 서버에 둔다. 어떤 비밀정보도 저장소, 앱 바이너리, 클라이언트 번들에 포함하지 않는다.
 - 별도 DB 계정과 최소 권한을 사용하고, 운영/개발 자격 증명을 분리한다. 자격 증명은 유출·퇴사·전환 때 교체 가능하게 관리한다.
 - DB 백업 빈도와 보존 기간은 데이터 손실 허용치(RPO)에 맞춘다. 복구 소요시간 목표(RTO)와 장애 시 담당 절차도 정한다.
 - 백업은 암호화하고 DB와 다른 장애 영역에 저장하며, 정기적으로 복원 검증한다. 백업 파일이 있다는 것만으로 복구 가능성이 보장되지는 않는다.
@@ -158,57 +159,56 @@ flowchart LR
 
 ## 9. 단계별 실행 계획과 전환 조건
 
-### 0단계: 현재 자원 목록과 비용 확인
+### 0단계: 자원 및 연결 조건 확인
 
-- OCI 콘솔에서 세 VM의 shape, OCPU/메모리, 리전, 부팅 볼륨, 공인 IP, `Always Free-eligible` 여부, 실제 비용을 기록한다.
-- Neon 콘솔에서 일일 제한 집계 기준, 잔여량, 소진 시각, compute 사용량과 동시 접속 수를 확인한다. 저장 공간은 핵심 병목으로 가정하지 않는다.
-- Vercel의 웹 도메인과 API 도메인, 환경변수 관리 방법, 로그인 방식, 개인정보 종류를 정리한다.
+- OCI에서 VM별 shape, CPU/메모리, 리전, 공인 IP, 무료 자격, 방화벽 규칙과 예상 청구를 확인한다. 특히 VM 1 API와 VM 2 broker를 별도 운영할 실자원이 있는지 확인한다.
+- 집 회선의 외부 접속 품질과 공인 IP 변동 여부, 노트북 절전/재부팅, consumer 자동 실행을 점검한다.
+- RabbitMQ 계정별 일일 제한이 있다면 계정 화면에서 정확한 단위와 재설정 시각을 기록한다. Neon은 전환 전 임시 환경으로만 고려한다.
 
-**완료 기준:** Neon 일일 사용 제한의 의미와 OCI VM의 최소 CPU·메모리 사양을 콘솔 기준으로 설명할 수 있다.
+**완료 기준:** 하루 100명/일 부하 요구와 home PC의 지속 가동 조건, Oracle VM의 CPU·메모리 및 broker listener 노출 조건을 확인한다.
 
-### 1단계: 100명/일 목표의 단순 서비스 출시
+### 1단계: API·Broker·집 Backend 연결 구축
 
-- Oracle VM 한 대에 API와 HTTPS reverse proxy를 배포하고, 웹·앱에서 공유할 버전형 API 계약을 정한다.
-- Neon 일일 제한이 사용 시간 요구를 충족하면 pooled connection으로 연결한다. 그렇지 않으면 가정용 PostgreSQL을 VPN으로 연결하고 API 계층에서 인증·인가·검증을 수행한다.
-- Neon 일일 접속 사용량과 제한 도달 시각, pool 대기, API 지연·오류를 추적한다.
-- 개발·스테이징/운영 환경의 DB와 자격 증명을 구분한다.
+- Oracle VM 1에 HTTPS API, VM 2에 RabbitMQ를 배포한다. API-to-broker는 OCI 내부 네트워크를 사용하고 집 consumer만 외부 AMQPS endpoint에 접속하도록 한다.
+- 집 PC에 별도 consumer 서비스와 PostgreSQL을 배포한다. Consumer는 AMQPS로 연결하고 DB에는 localhost/LAN으로만 연결한다.
+- API가 CRUD 명령을 Request-Reply로 게시하고 집 consumer가 DB 트랜잭션을 실행해 결과를 correlation ID와 함께 반환하도록 한다.
+- TLS 인증서, API/consumer 별도 RabbitMQ 사용자, vhost/queue 최소 권한, 5671 접근 규칙, 비공개 관리 UI를 적용한다.
 
-**완료 기준:** 대표 사용자 흐름을 기반으로 하루 100명 분량과 예상 피크를 재현하고, 브라우저와 앱이 같은 API에서 CRUD를 수행한다. DB 자격 증명은 클라이언트에 노출되지 않으며, API/DB VM의 CPU·메모리와 DB 연결 대기를 관측한다.
+**완료 기준:** 하루 100명 요청과 예상 피크를 대표 사용자 흐름으로 재현한다. 집 인바운드 HTTP와 PostgreSQL은 닫혀 있고 집 consumer가 outbound AMQPS로 재연결된다. timeout·집 offline·broker restart·중복 요청·DB transaction rollback·consumer 재시작을 검증한다.
 
-### 2단계: 비동기 작업 도입 (필요 시)
+### 2단계: 복구 및 관측 보강
 
-- 사용자 요청을 오래 붙잡는 작업이나 재시도 가능한 작업이 확인되면 worker와 RabbitMQ를 도입한다.
-- 큐가 필요한 기능만 비동기로 바꾸고, API는 작업 ID와 상태 조회 또는 알림을 제공한다.
-- 재전달·중복 실행·worker 중단·큐 적체를 검증한다.
+- API→broker→consumer→DB 경로에서 correlation ID를 기록하고 지연·timeout·실패·큐 깊이·consumer 연결을 관측한다.
+- DB 백업을 집 밖 암호화 저장소에 보관하고 다른 환경에서 복원 리허설을 한다.
+- 실제 비동기 장기 작업이 생기면 사용자 대기 CRUD와 별도 큐로 분리하고 worker 정책을 추가한다.
 
-**전환 조건:** 작업이 응답시간을 실질적으로 악화시키거나 재시도·분리 운영 필요가 생겼을 때. 단순 CRUD만 있는 동안은 도입을 미룬다.
+**완료 기준:** 집 PC 또는 broker 장애 후 consumer가 자동 복구하고, 처리 중 메시지의 재전달/중복을 안전하게 처리하며 백업에서 복구할 수 있다.
 
-### 3단계: DB 이전 여부 판단
+### 3단계: Neon 종료 또는 역할 축소
 
-- 일일 접속 제한이면 pooled URL, 앱 pool 크기, 연결 재사용·유휴 수명, 요청별 연결 생성 여부를 조정한다.
-- 제한이 지속되면 OCI 최소 사양 VM의 CPU·메모리 부하 시험과 가정용 DB의 가동률·복구 조건을 비교한다.
-- 문제가 지속되면 Oracle VM PostgreSQL과 가정용 DB를 데이터 증가량, 지연, 운영 가능 시간, 복구 목표, 외부 백업 비용/용량으로 비교한다.
-- 이전 전 전체 백업, 스키마/데이터 이관, 애플리케이션 전환, 읽기 검증, 롤백 기준을 리허설한다.
-
-**완료 기준:** 백업 복구가 성공했고, 이관 중 데이터 정합성과 복귀 경로를 검증했다. 검증 전 운영 DB를 폐기하지 않는다.
+- Neon을 개발·임시 용도로 유지할 이유가 없다면 home PostgreSQL로 데이터를 이관한다.
+- 전체 백업, schema/data 이관, row count 및 업무 데이터 검증, 앱 연결 전환과 rollback 기준을 리허설한다.
+- 이전 검증이 끝나기 전 기존 데이터를 삭제하지 않는다.
 
 ## 10. 핵심 위험과 대응
 
 | 위험 | 영향 | 대응 |
 |---|---|---|
-| 가정용 회선/전원/노트북 장애 | API가 집 DB에 연결하지 못해 전체 CRUD 중단 | 초기 운영 DB로 사용을 미루거나, 명시적 중단 허용과 VPN·알림·외부 백업·복구 절차를 갖춘 뒤 사용 |
+| 집 회선/전원/노트북 또는 home consumer 장애 | CRUD 응답 지연, timeout, broker queue 적체 | API timeout, consumer 자동 재연결, 제한된 재시도/격리, 큐 모니터링과 집 밖 백업·복구 |
 | 무료 VM 회수/정책·한도 변경 | API, broker 또는 DB 인스턴스가 중단되거나 비용 발생 | 실제 계정 한도와 청구 확인, 구성 재생성 문서화, 백업 외부 보관, 비용 경보·할당량 확인 |
 | DB 연결 고갈 | 요청 지연·오류 | pooled connection, 제한된 app pool, 연결 누수 점검, 동시 연결 모니터링 |
 | Neon 일일 접속 제한 소진 | DB 작업 제한으로 서비스 지연·중단 | 일일 제한 기준 확인, pooler·연결 재사용 최적화, 사용량 계측과 이전 계획 |
 | OCI VM CPU·메모리 부족 | API/DB 지연, OOM, worker 종료 | 부하 시험, API·DB·broker 동시 상주 회피, 핵심 역할만 배치 |
-| RabbitMQ 메시지 중복 또는 worker 장애 | 중복 변경·큐 적체 | 비동기 작업에서 멱등 처리, 재시도 횟수/격리 정책, backlog와 오류 알림 |
+| RabbitMQ 중복 메시지 또는 consumer 장애 | 중복 DB 변경·큐 적체·API timeout | idempotency key, ack-after-commit, 제한 재시도/격리, 큐 깊이·consumer 상태 알림 |
 | 백업은 있지만 복구 실패 | 영구 데이터 손실 | 정기 복원 리허설, DB와 다른 장애 영역에 암호화된 백업 보관 |
 
 ## 11. 최종 권고
 
-목표 규모가 하루 방문자 약 100명이라면 **Vercel + Oracle 최소 사양 VM의 단일 API + 단일 PostgreSQL DB**로 시작하고 서비스 분해와 RabbitMQ는 미룬다. Neon의 일일 접속 제한이 100명/일의 서비스 시간 요구를 만족하면 pooled connection으로 Neon을 쓴다. 그렇지 않으면 OCI VM은 API에 집중시키고 가정용 고성능 노트북의 PostgreSQL을 VPN으로 연결하는 구성을 우선 검토한다.
+하루 방문자 약 100명과 Neon Free 일일 접속 제약을 고려한 목표 아키텍처는 **Vercel 웹/앱 → Oracle API → RabbitMQ(AMQPS) → 가정용 별도 백엔드 consumer → 로컬 PostgreSQL**이다. 집 backend process는 큐에서 요청을 받아 로컬 DB에 CRUD를 수행하고 correlation ID에 맞춰 응답한다. 이전 문서에서 이 가정용 백엔드 프로세스가 빠져 있었고, 이번 개정에서 명시했다.
 
-Neon의 일일 접속 제한이 사용자 이용을 막으면 pooler와 앱 연결 수명을 먼저 점검하고, 그래도 해결되지 않으면 가정용 DB를 목표 DB로 검토한다. OCI VM은 최소 CPU·메모리 사양이므로 API에 집중하고, 집 DB는 VPN으로만 노출한다. 가정용 DB를 운영 주 DB로 택할 때는 자동 재시작, 집 밖 암호화 백업, 복구 리허설을 전제로 한다. 고객 데이터의 중요도와 중단 비용이 커지면 감당 가능한 관리형 DB 또는 유료 인프라도 선택지에 포함한다.
+RabbitMQ의 선택 이유는 AMQPS가 HTTPS보다 본질적으로 더 강한 암호화여서가 아니다. TLS는 두 프로토콜 모두 보호한다. 이 구조의 보안·운영상 이점은 집의 HTTP/API와 DB 인바운드 포트를 닫고, 집 consumer가 broker에 outbound 연결하며, DB와 백엔드 프로세스를 집 내부에 함께 둔다는 점이다. 반면 Oracle의 RabbitMQ 5671은 집에서 접근 가능해야 하므로 공개 broker endpoint를 TLS/mTLS, 분리된 사용자와 최소 권한, 방화벽 제한, 관리 UI 비공개로 보호한다.
+
+최소 사양 OCI VM은 API와 broker 역할을 분리해 CPU·메모리를 확인하고, 집 서버는 PostgreSQL과 consumer를 함께 운영한다. 모든 사용자 CRUD를 Request-Reply로 처리할 때의 timeout, 큐 적체, 중복 실행, 집 인터넷/전원 장애를 100명/일 대표 부하와 복구 시험으로 확인한다. 디스크는 현재 주된 제약으로 보지 않는다.
 
 ## 참고 자료
 
@@ -218,9 +218,7 @@ Neon의 일일 접속 제한이 사용자 이용을 막으면 pooler와 앱 연�
 - [Neon compute and connection limits](https://neon.com/docs/manage/computes)
 - [Neon connection pooling](https://neon.com/docs/connect/connection-pooling)
 - [RabbitMQ RPC tutorial](https://www.rabbitmq.com/tutorials/tutorial-six-javascript)
-- [WireGuard Quick Start](https://www.wireguard.com/quickstart/)
-
-
-
-
+- [RabbitMQ TLS support](https://www.rabbitmq.com/docs/ssl)
+- [RabbitMQ access control](https://www.rabbitmq.com/docs/access-control)
+- [RabbitMQ networking and ports](https://www.rabbitmq.com/docs/networking)
 
